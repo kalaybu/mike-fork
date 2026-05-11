@@ -16,3 +16,6 @@ next-env.d.ts
 .DS_Store
 .vercel
 coverage
+
+# Local file-storage backend
+backend/uploads/

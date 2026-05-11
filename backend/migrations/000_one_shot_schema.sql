@@ -1,340 +1,347 @@
--- Mike one-shot Supabase schema
--- Based on supabase-migration.sql plus the later backend/migrations/*.sql files.
--- Use this for a fresh Supabase database. Existing deployments should continue
--- to apply the incremental migration files instead.
+-- Mike one-shot schema (Microsoft SQL Server / Azure SQL).
+-- Auth is handled by the Express backend (bcrypt + JWT). No RLS — the
+-- backend is the sole DB client and enforces access in app code. JSON
+-- columns are stored as nvarchar(max); the backend serialises/parses
+-- them on read and write.
+--
+-- Run against a fresh `mike` database. If running interactively in SSMS,
+-- make sure you're connected to the `mike` database first (use [mike]).
 
-create extension if not exists "pgcrypto";
+-- ---------------------------------------------------------------------------
+-- Users (auth)
+-- ---------------------------------------------------------------------------
+
+if object_id('dbo.users', 'U') is null
+  create table dbo.users (
+    id uniqueidentifier not null primary key default newid(),
+    email nvarchar(320) not null,
+    password_hash nvarchar(200) not null,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset(),
+    constraint uq_users_email unique (email)
+  );
+
+if not exists (select 1 from sys.indexes where name = 'idx_users_email_lower')
+  create index idx_users_email_lower on dbo.users (email);
 
 -- ---------------------------------------------------------------------------
 -- User profiles
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.user_profiles (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null unique references auth.users(id) on delete cascade,
-  display_name text,
-  organisation text,
-  tier text not null default 'Free',
-  message_credits_used integer not null default 0,
-  credits_reset_date timestamptz not null default (now() + interval '30 days'),
-  tabular_model text not null default 'gemini-3-flash-preview',
-  claude_api_key text,
-  gemini_api_key text,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if object_id('dbo.user_profiles', 'U') is null
+  create table dbo.user_profiles (
+    id uniqueidentifier not null primary key default newid(),
+    user_id uniqueidentifier not null unique
+      references dbo.users(id) on delete cascade,
+    display_name nvarchar(200) null,
+    organisation nvarchar(200) null,
+    tier nvarchar(50) not null default 'Free',
+    message_credits_used int not null default 0,
+    credits_reset_date datetimeoffset not null default dateadd(day, 30, sysdatetimeoffset()),
+    tabular_model nvarchar(100) not null default 'azure-gpt-4.1-mini',
+    claude_api_key nvarchar(500) null,
+    gemini_api_key nvarchar(500) null,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_user_profiles_user
-  on public.user_profiles(user_id);
-
-alter table public.user_profiles enable row level security;
-
-drop policy if exists "Users can view their own profile" on public.user_profiles;
-create policy "Users can view their own profile"
-  on public.user_profiles for select
-  using (auth.uid() = user_id);
-
-drop policy if exists "Users can update their own profile" on public.user_profiles;
-create policy "Users can update their own profile"
-  on public.user_profiles for update
-  using (auth.uid() = user_id);
-
-create or replace function public.handle_new_user()
-returns trigger
-language plpgsql
-security definer
-set search_path = public
-as $$
-begin
-  insert into public.user_profiles (user_id)
-  values (new.id)
-  on conflict (user_id) do nothing;
-  return new;
-exception when others then
-  -- Never block signup if the profile insert fails.
-  return new;
-end;
-$$;
-
-drop trigger if exists on_auth_user_created on auth.users;
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute procedure public.handle_new_user();
+if not exists (select 1 from sys.indexes where name = 'idx_user_profiles_user')
+  create index idx_user_profiles_user on dbo.user_profiles(user_id);
 
 -- ---------------------------------------------------------------------------
 -- Projects and documents
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.projects (
-  id uuid primary key default gen_random_uuid(),
-  user_id text not null,
-  name text not null,
-  cm_number text,
-  visibility text not null default 'private',
-  shared_with jsonb not null default '[]'::jsonb,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if object_id('dbo.projects', 'U') is null
+  create table dbo.projects (
+    id uniqueidentifier not null primary key default newid(),
+    user_id nvarchar(100) not null,
+    name nvarchar(500) not null,
+    cm_number nvarchar(100) null,
+    visibility nvarchar(50) not null default 'private',
+    shared_with nvarchar(max) not null default '[]',
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_projects_user
-  on public.projects(user_id);
+if not exists (select 1 from sys.indexes where name = 'idx_projects_user')
+  create index idx_projects_user on dbo.projects(user_id);
 
-create index if not exists projects_shared_with_idx
-  on public.projects using gin (shared_with);
+if object_id('dbo.project_subfolders', 'U') is null
+  create table dbo.project_subfolders (
+    id uniqueidentifier not null primary key default newid(),
+    project_id uniqueidentifier not null
+      references dbo.projects(id) on delete cascade,
+    user_id nvarchar(100) not null,
+    name nvarchar(500) not null,
+    parent_folder_id uniqueidentifier null
+      references dbo.project_subfolders(id),
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.project_subfolders (
-  id uuid primary key default gen_random_uuid(),
-  project_id uuid not null references public.projects(id) on delete cascade,
-  user_id text not null,
-  name text not null,
-  parent_folder_id uuid references public.project_subfolders(id) on delete cascade,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if not exists (select 1 from sys.indexes where name = 'idx_project_subfolders_project')
+  create index idx_project_subfolders_project on dbo.project_subfolders(project_id);
 
-create index if not exists idx_project_subfolders_project
-  on public.project_subfolders(project_id);
+if object_id('dbo.documents', 'U') is null
+  create table dbo.documents (
+    id uniqueidentifier not null primary key default newid(),
+    project_id uniqueidentifier null
+      references dbo.projects(id) on delete cascade,
+    user_id nvarchar(100) not null,
+    filename nvarchar(500) not null,
+    file_type nvarchar(100) null,
+    size_bytes bigint not null default 0,
+    page_count int null,
+    structure_tree nvarchar(max) null,
+    status nvarchar(50) not null default 'pending',
+    folder_id uniqueidentifier null
+      references dbo.project_subfolders(id) on delete no action,
+    current_version_id uniqueidentifier null,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.documents (
-  id uuid primary key default gen_random_uuid(),
-  project_id uuid references public.projects(id) on delete cascade,
-  user_id text not null,
-  filename text not null,
-  file_type text,
-  size_bytes integer not null default 0,
-  page_count integer,
-  structure_tree jsonb,
-  status text not null default 'pending',
-  folder_id uuid references public.project_subfolders(id) on delete set null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if not exists (select 1 from sys.indexes where name = 'idx_documents_user_project')
+  create index idx_documents_user_project on dbo.documents(user_id, project_id);
 
-create index if not exists idx_documents_user_project
-  on public.documents(user_id, project_id);
+if not exists (select 1 from sys.indexes where name = 'idx_documents_project_folder')
+  create index idx_documents_project_folder on dbo.documents(project_id, folder_id);
 
-create index if not exists idx_documents_project_folder
-  on public.documents(project_id, folder_id);
+if object_id('dbo.document_versions', 'U') is null
+  create table dbo.document_versions (
+    id uniqueidentifier not null primary key default newid(),
+    document_id uniqueidentifier not null
+      references dbo.documents(id) on delete cascade,
+    storage_path nvarchar(1000) not null,
+    pdf_storage_path nvarchar(1000) null,
+    source nvarchar(50) not null default 'upload'
+      check (source in (
+        'upload', 'user_upload', 'assistant_edit',
+        'user_accept', 'user_reject', 'generated'
+      )),
+    version_number int null,
+    display_name nvarchar(500) null,
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.document_versions (
-  id uuid primary key default gen_random_uuid(),
-  document_id uuid not null references public.documents(id) on delete cascade,
-  storage_path text not null,
-  pdf_storage_path text,
-  source text not null default 'upload',
-  version_number integer,
-  display_name text,
-  created_at timestamptz not null default now(),
-  constraint document_versions_source_check
-    check (source = any (array[
-      'upload'::text,
-      'user_upload'::text,
-      'assistant_edit'::text,
-      'user_accept'::text,
-      'user_reject'::text,
-      'generated'::text
-    ]))
-);
+if not exists (select 1 from sys.indexes where name = 'idx_document_versions_document_id')
+  create index idx_document_versions_document_id
+    on dbo.document_versions(document_id, created_at desc);
 
-create index if not exists document_versions_document_id_idx
-  on public.document_versions(document_id, created_at desc);
+if not exists (select 1 from sys.indexes where name = 'idx_document_versions_doc_vnum')
+  create index idx_document_versions_doc_vnum
+    on dbo.document_versions(document_id, version_number);
 
-create index if not exists document_versions_doc_vnum_idx
-  on public.document_versions(document_id, version_number);
+-- The current_version_id FK is added after document_versions is created
+-- to break the cycle. Note: SQL Server forbids ON DELETE SET NULL on a
+-- circular path, so we leave it as NO ACTION here and clear it in app code
+-- when needed.
+if not exists (
+  select 1 from sys.foreign_keys where name = 'fk_documents_current_version'
+)
+  alter table dbo.documents
+    add constraint fk_documents_current_version
+    foreign key (current_version_id) references dbo.document_versions(id);
 
-alter table public.documents
-  add column if not exists current_version_id uuid
-  references public.document_versions(id) on delete set null;
+if object_id('dbo.document_edits', 'U') is null
+  create table dbo.document_edits (
+    id uniqueidentifier not null primary key default newid(),
+    document_id uniqueidentifier not null
+      references dbo.documents(id) on delete cascade,
+    chat_message_id uniqueidentifier null,
+    version_id uniqueidentifier not null
+      references dbo.document_versions(id) on delete no action,
+    change_id nvarchar(100) not null,
+    del_w_id nvarchar(100) null,
+    ins_w_id nvarchar(100) null,
+    deleted_text nvarchar(max) not null default '',
+    inserted_text nvarchar(max) not null default '',
+    context_before nvarchar(max) null,
+    context_after nvarchar(max) null,
+    status nvarchar(50) not null default 'pending'
+      check (status in ('pending', 'accepted', 'rejected')),
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    resolved_at datetimeoffset null
+  );
 
-create table if not exists public.document_edits (
-  id uuid primary key default gen_random_uuid(),
-  document_id uuid not null references public.documents(id) on delete cascade,
-  chat_message_id uuid,
-  version_id uuid not null references public.document_versions(id) on delete cascade,
-  change_id text not null,
-  del_w_id text,
-  ins_w_id text,
-  deleted_text text not null default '',
-  inserted_text text not null default '',
-  context_before text,
-  context_after text,
-  status text not null default 'pending'
-    check (status = any (array[
-      'pending'::text,
-      'accepted'::text,
-      'rejected'::text
-    ])),
-  created_at timestamptz not null default now(),
-  resolved_at timestamptz
-);
+if not exists (select 1 from sys.indexes where name = 'idx_document_edits_document_id')
+  create index idx_document_edits_document_id
+    on dbo.document_edits(document_id, created_at desc);
 
-create index if not exists document_edits_document_id_idx
-  on public.document_edits(document_id, created_at desc);
+if not exists (select 1 from sys.indexes where name = 'idx_document_edits_message_id')
+  create index idx_document_edits_message_id on dbo.document_edits(chat_message_id);
 
-create index if not exists document_edits_message_id_idx
-  on public.document_edits(chat_message_id);
-
-create index if not exists document_edits_version_id_idx
-  on public.document_edits(version_id);
+if not exists (select 1 from sys.indexes where name = 'idx_document_edits_version_id')
+  create index idx_document_edits_version_id on dbo.document_edits(version_id);
 
 -- ---------------------------------------------------------------------------
 -- Workflows
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.workflows (
-  id uuid primary key default gen_random_uuid(),
-  user_id text,
-  title text not null,
-  type text not null,
-  prompt_md text,
-  columns_config jsonb,
-  practice text,
-  is_system boolean not null default false,
-  created_at timestamptz not null default now()
-);
+if object_id('dbo.workflows', 'U') is null
+  create table dbo.workflows (
+    id uniqueidentifier not null primary key default newid(),
+    user_id nvarchar(100) null,
+    title nvarchar(500) not null,
+    type nvarchar(50) not null,
+    prompt_md nvarchar(max) null,
+    columns_config nvarchar(max) null,
+    practice nvarchar(200) null,
+    is_system bit not null default 0,
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_workflows_user
-  on public.workflows(user_id);
+if not exists (select 1 from sys.indexes where name = 'idx_workflows_user')
+  create index idx_workflows_user on dbo.workflows(user_id);
 
-create table if not exists public.hidden_workflows (
-  id uuid primary key default gen_random_uuid(),
-  user_id text not null,
-  workflow_id text not null,
-  created_at timestamptz not null default now(),
-  unique(user_id, workflow_id)
-);
+if object_id('dbo.hidden_workflows', 'U') is null
+  create table dbo.hidden_workflows (
+    id uniqueidentifier not null primary key default newid(),
+    user_id nvarchar(100) not null,
+    workflow_id nvarchar(100) not null,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    constraint uq_hidden_workflows unique (user_id, workflow_id)
+  );
 
-create index if not exists idx_hidden_workflows_user
-  on public.hidden_workflows(user_id);
+if not exists (select 1 from sys.indexes where name = 'idx_hidden_workflows_user')
+  create index idx_hidden_workflows_user on dbo.hidden_workflows(user_id);
 
-create table if not exists public.workflow_shares (
-  id uuid primary key default gen_random_uuid(),
-  workflow_id uuid not null references public.workflows(id) on delete cascade,
-  shared_by_user_id text not null,
-  shared_with_email text not null,
-  allow_edit boolean not null default false,
-  created_at timestamptz not null default now(),
-  constraint workflow_shares_workflow_email_unique
-    unique(workflow_id, shared_with_email)
-);
+if object_id('dbo.workflow_shares', 'U') is null
+  create table dbo.workflow_shares (
+    id uniqueidentifier not null primary key default newid(),
+    workflow_id uniqueidentifier not null
+      references dbo.workflows(id) on delete cascade,
+    shared_by_user_id nvarchar(100) not null,
+    shared_with_email nvarchar(320) not null,
+    allow_edit bit not null default 0,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    constraint uq_workflow_shares unique (workflow_id, shared_with_email)
+  );
 
-create index if not exists workflow_shares_workflow_id_idx
-  on public.workflow_shares(workflow_id);
+if not exists (select 1 from sys.indexes where name = 'idx_workflow_shares_workflow_id')
+  create index idx_workflow_shares_workflow_id on dbo.workflow_shares(workflow_id);
 
-create index if not exists workflow_shares_email_idx
-  on public.workflow_shares(shared_with_email);
+if not exists (select 1 from sys.indexes where name = 'idx_workflow_shares_email')
+  create index idx_workflow_shares_email on dbo.workflow_shares(shared_with_email);
 
 -- ---------------------------------------------------------------------------
 -- Assistant chats
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.chats (
-  id uuid primary key default gen_random_uuid(),
-  project_id uuid references public.projects(id) on delete cascade,
-  user_id text not null,
-  title text,
-  created_at timestamptz not null default now()
-);
+if object_id('dbo.chats', 'U') is null
+  create table dbo.chats (
+    id uniqueidentifier not null primary key default newid(),
+    project_id uniqueidentifier null
+      references dbo.projects(id) on delete cascade,
+    user_id nvarchar(100) not null,
+    title nvarchar(500) null,
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_chats_user
-  on public.chats(user_id);
+if not exists (select 1 from sys.indexes where name = 'idx_chats_user')
+  create index idx_chats_user on dbo.chats(user_id);
 
-create index if not exists idx_chats_project
-  on public.chats(project_id);
+if not exists (select 1 from sys.indexes where name = 'idx_chats_project')
+  create index idx_chats_project on dbo.chats(project_id);
 
-create table if not exists public.chat_messages (
-  id uuid primary key default gen_random_uuid(),
-  chat_id uuid not null references public.chats(id) on delete cascade,
-  role text not null,
-  content jsonb,
-  files jsonb,
-  annotations jsonb,
-  created_at timestamptz not null default now()
-);
+if object_id('dbo.chat_messages', 'U') is null
+  create table dbo.chat_messages (
+    id uniqueidentifier not null primary key default newid(),
+    chat_id uniqueidentifier not null
+      references dbo.chats(id) on delete cascade,
+    role nvarchar(50) not null,
+    content nvarchar(max) null,
+    files nvarchar(max) null,
+    annotations nvarchar(max) null,
+    workflow nvarchar(max) null,
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_chat_messages_chat
-  on public.chat_messages(chat_id);
+if not exists (select 1 from sys.indexes where name = 'idx_chat_messages_chat')
+  create index idx_chat_messages_chat on dbo.chat_messages(chat_id);
 
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'document_edits_chat_message_id_fkey'
-      and conrelid = 'public.document_edits'::regclass
-  ) then
-    alter table public.document_edits
-      add constraint document_edits_chat_message_id_fkey
-      foreign key (chat_message_id)
-      references public.chat_messages(id)
-      on delete set null;
-  end if;
-end;
-$$;
+if not exists (
+  select 1 from sys.foreign_keys where name = 'fk_document_edits_chat_message'
+)
+  alter table dbo.document_edits
+    add constraint fk_document_edits_chat_message
+    foreign key (chat_message_id) references dbo.chat_messages(id)
+    on delete no action;
 
 -- ---------------------------------------------------------------------------
 -- Tabular reviews
 -- ---------------------------------------------------------------------------
 
-create table if not exists public.tabular_reviews (
-  id uuid primary key default gen_random_uuid(),
-  project_id uuid references public.projects(id) on delete cascade,
-  user_id text not null,
-  title text,
-  columns_config jsonb,
-  workflow_id uuid references public.workflows(id) on delete set null,
-  practice text,
-  shared_with jsonb not null default '[]'::jsonb,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if object_id('dbo.tabular_reviews', 'U') is null
+  create table dbo.tabular_reviews (
+    id uniqueidentifier not null primary key default newid(),
+    project_id uniqueidentifier null
+      references dbo.projects(id) on delete cascade,
+    user_id nvarchar(100) not null,
+    title nvarchar(500) null,
+    columns_config nvarchar(max) null,
+    workflow_id uniqueidentifier null
+      references dbo.workflows(id) on delete set null,
+    practice nvarchar(200) null,
+    shared_with nvarchar(max) not null default '[]',
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create index if not exists idx_tabular_reviews_user
-  on public.tabular_reviews(user_id);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_reviews_user')
+  create index idx_tabular_reviews_user on dbo.tabular_reviews(user_id);
 
-create index if not exists idx_tabular_reviews_project
-  on public.tabular_reviews(project_id);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_reviews_project')
+  create index idx_tabular_reviews_project on dbo.tabular_reviews(project_id);
 
-create index if not exists tabular_reviews_shared_with_idx
-  on public.tabular_reviews using gin (shared_with);
+if object_id('dbo.tabular_cells', 'U') is null
+  create table dbo.tabular_cells (
+    id uniqueidentifier not null primary key default newid(),
+    review_id uniqueidentifier not null
+      references dbo.tabular_reviews(id) on delete cascade,
+    document_id uniqueidentifier not null
+      references dbo.documents(id) on delete no action,
+    column_index int not null,
+    content nvarchar(max) null,
+    citations nvarchar(max) null,
+    status nvarchar(50) not null default 'pending',
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.tabular_cells (
-  id uuid primary key default gen_random_uuid(),
-  review_id uuid not null references public.tabular_reviews(id) on delete cascade,
-  document_id uuid not null references public.documents(id) on delete cascade,
-  column_index integer not null,
-  content text,
-  citations jsonb,
-  status text not null default 'pending',
-  created_at timestamptz not null default now()
-);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_cells_review')
+  create index idx_tabular_cells_review
+    on dbo.tabular_cells(review_id, document_id, column_index);
 
-create index if not exists idx_tabular_cells_review
-  on public.tabular_cells(review_id, document_id, column_index);
+if object_id('dbo.tabular_review_chats', 'U') is null
+  create table dbo.tabular_review_chats (
+    id uniqueidentifier not null primary key default newid(),
+    review_id uniqueidentifier not null
+      references dbo.tabular_reviews(id) on delete cascade,
+    user_id nvarchar(100) not null,
+    title nvarchar(500) null,
+    created_at datetimeoffset not null default sysdatetimeoffset(),
+    updated_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.tabular_review_chats (
-  id uuid primary key default gen_random_uuid(),
-  review_id uuid not null references public.tabular_reviews(id) on delete cascade,
-  user_id text not null,
-  title text,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_review_chats_review')
+  create index idx_tabular_review_chats_review
+    on dbo.tabular_review_chats(review_id, updated_at desc);
 
-create index if not exists tabular_review_chats_review_idx
-  on public.tabular_review_chats(review_id, updated_at desc);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_review_chats_user')
+  create index idx_tabular_review_chats_user on dbo.tabular_review_chats(user_id);
 
-create index if not exists tabular_review_chats_user_idx
-  on public.tabular_review_chats(user_id);
+if object_id('dbo.tabular_review_chat_messages', 'U') is null
+  create table dbo.tabular_review_chat_messages (
+    id uniqueidentifier not null primary key default newid(),
+    chat_id uniqueidentifier not null
+      references dbo.tabular_review_chats(id) on delete cascade,
+    role nvarchar(50) not null,
+    content nvarchar(max) null,
+    annotations nvarchar(max) null,
+    created_at datetimeoffset not null default sysdatetimeoffset()
+  );
 
-create table if not exists public.tabular_review_chat_messages (
-  id uuid primary key default gen_random_uuid(),
-  chat_id uuid not null references public.tabular_review_chats(id) on delete cascade,
-  role text not null,
-  content jsonb,
-  annotations jsonb,
-  created_at timestamptz not null default now()
-);
-
-create index if not exists tabular_review_chat_messages_chat_idx
-  on public.tabular_review_chat_messages(chat_id, created_at);
+if not exists (select 1 from sys.indexes where name = 'idx_tabular_review_chat_messages_chat')
+  create index idx_tabular_review_chat_messages_chat
+    on dbo.tabular_review_chat_messages(chat_id, created_at);

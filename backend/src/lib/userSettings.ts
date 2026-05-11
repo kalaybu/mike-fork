@@ -17,8 +17,10 @@ export type UserModelSettings = {
 // available, otherwise Claude Haiku. With no user keys set, defaults to Gemini
 // (the dev-mode env fallback).
 function resolveTitleModel(apiKeys: UserApiKeys): string {
-    if (apiKeys.gemini?.trim()) return DEFAULT_TITLE_MODEL;
+    // Azure is server-managed (single subscription), so always prefer it
+    // when no per-user provider keys are set.
     if (apiKeys.claude?.trim()) return "claude-haiku-4-5";
+    if (apiKeys.gemini?.trim()) return "gemini-3.1-flash-lite-preview";
     return DEFAULT_TITLE_MODEL;
 }
 

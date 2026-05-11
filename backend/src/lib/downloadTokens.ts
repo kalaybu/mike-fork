@@ -12,7 +12,7 @@ import crypto from "crypto";
 function getSecret(): string {
     return (
         process.env.DOWNLOAD_SIGNING_SECRET ??
-        process.env.SUPABASE_SECRET_KEY ??
+        process.env.JWT_SECRET ??
         "dev-secret"
     );
 }

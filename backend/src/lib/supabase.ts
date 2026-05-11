@@ -1,18 +1,19 @@
-import { createClient } from "@supabase/supabase-js";
+import { DbClient } from "./db/shim";
+import { verifySessionToken } from "./jwt";
 
 /**
- * Server-side Supabase client using the service role key.
- * Bypasses RLS — only use in API routes after verifying the user.
+ * Returns a query client. The function is named `createServerSupabase` for
+ * legacy reasons — its `.from(...).select()` API matches the slice of the
+ * Supabase JS client this codebase uses, but is now backed by Microsoft
+ * SQL Server via the in-process shim in `db/shim.ts`.
  */
 export function createServerSupabase() {
-  const url = process.env.SUPABASE_URL || "";
-  const key = process.env.SUPABASE_SECRET_KEY || "";
-  return createClient(url, key, { auth: { persistSession: false } });
+  return new DbClient();
 }
 
 /**
- * Extract and verify the Supabase JWT from the Authorization header.
- * Returns the user's UUID string, or throws a Response with 401.
+ * Verify the JWT in the Authorization header and return the user id.
+ * Throws a Response with 401 when missing or invalid.
  */
 export async function getUserIdFromRequest(req: Request): Promise<string> {
   const auth = req.headers.get("authorization") ?? "";
@@ -22,20 +23,9 @@ export async function getUserIdFromRequest(req: Request): Promise<string> {
     });
   }
   const token = auth.slice(7).trim();
-
-  const supabaseUrl = process.env.SUPABASE_URL || "";
-  const serviceKey = process.env.SUPABASE_SECRET_KEY || "";
-
-  if (!supabaseUrl || !serviceKey) {
-    throw new Response("Server auth is not configured", { status: 500 });
-  }
-
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
-  const { data } = await admin.auth.getUser(token);
-  if (!data.user) {
+  const session = verifySessionToken(token);
+  if (!session) {
     throw new Response("Invalid or expired token", { status: 401 });
   }
-  return data.user.id;
+  return session.sub;
 }

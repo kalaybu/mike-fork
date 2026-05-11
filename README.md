@@ -1,60 +1,81 @@
-# Mike
+# Mike (Azure fork)
 
-Open-source release containing the Mike frontend and backend.
+Modified version of [Mike](https://github.com/willchen96/mike) configured to
+run on Microsoft Azure: SQL Server for the database, Azure OpenAI for LLM,
+Azure Blob / Azure Files for document storage. See [NOTICE.md](./NOTICE.md)
+for a full list of modifications and the AGPL-3.0 attribution.
 
 ## Contents
 
-- `frontend/` - Next.js application
-- `backend/` - Express API, Supabase access, document processing, and migrations
-- `backend/migrations/000_one_shot_schema.sql` - one-shot Supabase schema for fresh databases
+- `frontend/` — Next.js 16 application
+- `backend/` — Express API, document processing, migrations
+- `backend/migrations/000_one_shot_schema.sql` — T-SQL schema for a fresh database
+- `docker-compose.yml` — local SQL Server (Azure SQL Edge) for development
 
-## Setup
+## Local setup
 
-Install dependencies:
+### Prerequisites
+
+- Node 20+
+- Docker Desktop (for local SQL Server)
+- LibreOffice on `PATH` (only required for DOC/DOCX → PDF conversion)
+- An Azure OpenAI deployment (or Anthropic / Gemini API keys)
+
+### 1. Spin up local SQL Server
 
 ```bash
-npm install --prefix backend
-npm install --prefix frontend
+docker compose up -d
 ```
 
-Create local env files from the examples:
+This starts an Azure SQL Edge container at `localhost:1433`
+(`sa` / `Local-Dev-1234`). To apply the schema, connect with SSMS (or any
+SQL client), `CREATE DATABASE mike;`, switch to it, and execute
+[`backend/migrations/000_one_shot_schema.sql`](backend/migrations/000_one_shot_schema.sql).
+
+### 2. Install dependencies
+
+```bash
+cd backend && npm install
+cd ../frontend && npm install
+```
+
+### 3. Configure environment
 
 ```bash
 cp backend/.env.example backend/.env
 cp frontend/.env.local.example frontend/.env.local
 ```
 
-Run `backend/migrations/000_one_shot_schema.sql` in the Supabase SQL editor for a fresh database.
+Fill in `backend/.env`:
 
-Start the backend:
+- `DATABASE_URL` — defaults match the local Docker container above
+- `JWT_SECRET` — any 32+ character random string
+- `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_API_VERSION`
 
-```bash
-npm run dev --prefix backend
-```
+`STORAGE_BACKEND` defaults to `local` and writes documents under
+`backend/uploads/` — no extra setup needed.
 
-Start the frontend:
-
-```bash
-npm run dev --prefix frontend
-```
-
-Open `http://localhost:3000`.
-
-## Required Services
-
-- Supabase Auth and Postgres
-- S3-compatible object storage, such as Cloudflare R2
-- At least one supported model provider key, depending on which models you enable
-- LibreOffice for DOC/DOCX to PDF conversion
-
-## Checks
+### 4. Run
 
 ```bash
-npm run build --prefix backend
-npm run build --prefix frontend
-npm run lint --prefix frontend
+# terminal 1
+cd backend && npm run dev
+# terminal 2
+cd frontend && npm run dev
 ```
+
+Open `http://localhost:3000`, sign up, and try a chat.
+
+## Production deploy on Azure
+
+- Backend: Web App for Containers (image from `backend/Dockerfile`), VNET
+  integrated to reach Azure SQL / OpenAI private endpoints
+- Frontend: Web App for Containers (image from `frontend/Dockerfile`)
+- Document storage: Azure Files share mounted at `/mnt/docs` on the
+  backend Web App with `STORAGE_BACKEND=local` and
+  `LOCAL_STORAGE_DIR=/mnt/docs` — or use `STORAGE_BACKEND=azure` against
+  Azure Blob Storage with `AZURE_STORAGE_CONNECTION_STRING`
 
 ## License
 
-AGPL-3.0-only. See `LICENSE`.
+AGPL-3.0-only. See [LICENSE](./LICENSE) and [NOTICE.md](./NOTICE.md).

@@ -59,19 +59,24 @@ export default function SignupPage() {
                 const trimmedName = name.trim();
                 const trimmedOrg = organisation.trim();
                 if (trimmedName || trimmedOrg) {
-                    // The handle_new_user DB trigger creates the
-                    // user_profiles row synchronously on auth.users insert,
-                    // so we UPDATE rather than upsert — RLS permits update
-                    // of the user's own row but blocks self-INSERT.
-                    const { error: profileError } = await supabase
-                        .from("user_profiles")
-                        .update({
-                            ...(trimmedName && { display_name: trimmedName }),
-                            ...(trimmedOrg && { organisation: trimmedOrg }),
-                            updated_at: new Date().toISOString(),
-                        })
-                        .eq("user_id", data.session.user.id);
-                    if (profileError) {
+                    const apiBase =
+                        process.env.NEXT_PUBLIC_API_BASE_URL ??
+                        "http://localhost:3001";
+                    try {
+                        await fetch(`${apiBase}/user/profile`, {
+                            method: "PATCH",
+                            headers: {
+                                "Content-Type": "application/json",
+                                Authorization: `Bearer ${data.session.access_token}`,
+                            },
+                            body: JSON.stringify({
+                                ...(trimmedName && {
+                                    display_name: trimmedName,
+                                }),
+                                ...(trimmedOrg && { organisation: trimmedOrg }),
+                            }),
+                        });
+                    } catch (profileError) {
                         console.error(
                             "[signup] failed to persist profile fields",
                             profileError,

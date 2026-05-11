@@ -1,0 +1,15 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: mike-sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "1"
+      MSSQL_SA_PASSWORD: "Local-Dev-1234"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mike-sqldata:/var/opt/mssql
+
+volumes:
+  mike-sqldata:

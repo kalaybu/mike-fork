@@ -1,7 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
-import { createClient } from "@supabase/supabase-js";
 import {
   attachActiveVersionPaths,
   attachLatestVersionNumbers,
@@ -166,11 +165,11 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
   if (!isOwner && !isShared)
     return void res.status(404).json({ detail: "Project not found" });
 
-  // Pull every auth user (matching the lookup endpoint's pattern). For
-  // larger deployments this should page or be replaced with a bulk-by-id
-  // RPC, but it keeps things simple while user counts are modest.
-  const { data: usersData } = await db.auth.admin.listUsers({ perPage: 1000 });
-  const allUsers = usersData?.users ?? [];
+  const { data: usersData } = await db
+    .from("users")
+    .select("id, email")
+    .limit(1000);
+  const allUsers = (usersData ?? []) as { id: string; email: string }[];
   const userByEmail = new Map<string, { id: string; email: string }>();
   const userById = new Map<string, { id: string; email: string }>();
   for (const u of allUsers) {

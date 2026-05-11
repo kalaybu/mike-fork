@@ -1,23 +1,194 @@
 /**
- * Cloudflare R2 storage utilities for Mike document management.
- * R2 is S3-compatible — uses @aws-sdk/client-s3.
+ * Storage abstraction. Three backends, picked by STORAGE_BACKEND env var:
+ *   - "local"  (default): writes under LOCAL_STORAGE_DIR (default ./uploads).
+ *                          Signed URLs hand out HMAC tokens routed through
+ *                          /download/:token on the backend.
+ *   - "azure":             Azure Blob Storage. Reads AZURE_STORAGE_CONNECTION_STRING
+ *                          and AZURE_STORAGE_CONTAINER (default "mike").
+ *                          Signed URLs are SAS URLs (browser-direct).
+ *   - "r2":                legacy Cloudflare R2 / S3-compatible (kept for
+ *                          deployments still pointed at R2).
  *
- * Required env vars:
- *   R2_ENDPOINT_URL     — https://<account-id>.r2.cloudflarestorage.com
- *   R2_ACCESS_KEY_ID    — R2 API token (Access Key ID)
- *   R2_SECRET_ACCESS_KEY — R2 API token (Secret Access Key)
- *   R2_BUCKET_NAME      — bucket name (default: "mike")
+ * All three implement the same exported function set; existing callers use
+ * uploadFile / downloadFile / deleteFile / getSignedUrl unchanged.
  */
 
+import * as fs from "fs/promises";
+import * as path from "path";
 import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand,
-} from "@aws-sdk/client-s3";
-import { getSignedUrl as awsGetSignedUrl } from "@aws-sdk/s3-request-presigner";
+  BlobServiceClient,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+  StorageSharedKeyCredential,
+} from "@azure/storage-blob";
+import { buildDownloadUrl } from "./downloadTokens";
 
-function getClient(): S3Client {
+type Backend = "local" | "azure" | "r2";
+
+function selectedBackend(): Backend {
+  const v = (process.env.STORAGE_BACKEND ?? "local").toLowerCase();
+  if (v === "azure" || v === "r2" || v === "local") return v;
+  return "local";
+}
+
+const BACKEND: Backend = selectedBackend();
+
+// ---------------------------------------------------------------------------
+// Local filesystem backend
+// ---------------------------------------------------------------------------
+
+const LOCAL_ROOT = path.resolve(
+  process.cwd(),
+  process.env.LOCAL_STORAGE_DIR ?? "uploads",
+);
+
+function localFullPath(key: string): string {
+  // Reject path traversal — keys are app-generated but be safe.
+  const safe = key.split("/").filter((seg) => seg && seg !== ".." && seg !== ".");
+  return path.join(LOCAL_ROOT, ...safe);
+}
+
+async function localUpload(
+  key: string,
+  content: ArrayBuffer,
+): Promise<void> {
+  const full = localFullPath(key);
+  await fs.mkdir(path.dirname(full), { recursive: true });
+  await fs.writeFile(full, Buffer.from(content));
+}
+
+async function localDownload(key: string): Promise<ArrayBuffer | null> {
+  try {
+    const buf = await fs.readFile(localFullPath(key));
+    return buf.buffer.slice(
+      buf.byteOffset,
+      buf.byteOffset + buf.byteLength,
+    ) as ArrayBuffer;
+  } catch {
+    return null;
+  }
+}
+
+async function localDelete(key: string): Promise<void> {
+  await fs.unlink(localFullPath(key)).catch(() => undefined);
+}
+
+function localSignedUrl(key: string, downloadFilename?: string): string {
+  // Re-use the existing HMAC-signed download token route. It handles auth
+  // (the route is gated by requireAuth) and Content-Disposition.
+  const filename = downloadFilename ?? path.basename(key);
+  const apiBase =
+    process.env.PUBLIC_BACKEND_URL ??
+    process.env.BACKEND_URL ??
+    "http://localhost:3001";
+  return `${apiBase}${buildDownloadUrl(key, filename)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Azure Blob backend
+// ---------------------------------------------------------------------------
+
+let _azureService: BlobServiceClient | null = null;
+let _azureKey: StorageSharedKeyCredential | null = null;
+
+function azureService(): BlobServiceClient {
+  if (_azureService) return _azureService;
+  const conn = process.env.AZURE_STORAGE_CONNECTION_STRING;
+  if (!conn) throw new Error("AZURE_STORAGE_CONNECTION_STRING is not set");
+  _azureService = BlobServiceClient.fromConnectionString(conn);
+  // Pull out the shared-key credential so we can sign SAS URLs without an
+  // additional network round-trip. fromConnectionString stashes a credential
+  // we can reuse, but the public surface doesn't expose it — re-parse the
+  // string ourselves.
+  const m = /AccountName=([^;]+);AccountKey=([^;]+)/.exec(conn);
+  if (m) {
+    _azureKey = new StorageSharedKeyCredential(m[1], m[2]);
+  }
+  return _azureService;
+}
+
+const AZURE_CONTAINER = process.env.AZURE_STORAGE_CONTAINER ?? "mike";
+
+async function azureContainer() {
+  const svc = azureService();
+  const c = svc.getContainerClient(AZURE_CONTAINER);
+  await c.createIfNotExists();
+  return c;
+}
+
+async function azureUpload(
+  key: string,
+  content: ArrayBuffer,
+  contentType: string,
+): Promise<void> {
+  const c = await azureContainer();
+  const blob = c.getBlockBlobClient(key);
+  await blob.uploadData(Buffer.from(content), {
+    blobHTTPHeaders: { blobContentType: contentType },
+  });
+}
+
+async function azureDownload(key: string): Promise<ArrayBuffer | null> {
+  try {
+    const c = await azureContainer();
+    const blob = c.getBlockBlobClient(key);
+    const buf = await blob.downloadToBuffer();
+    return buf.buffer.slice(
+      buf.byteOffset,
+      buf.byteOffset + buf.byteLength,
+    ) as ArrayBuffer;
+  } catch {
+    return null;
+  }
+}
+
+async function azureDelete(key: string): Promise<void> {
+  try {
+    const c = await azureContainer();
+    await c.deleteBlob(key);
+  } catch {
+    // ignore
+  }
+}
+
+function azureSignedUrl(
+  key: string,
+  expiresIn: number,
+  downloadFilename?: string,
+): string {
+  if (!_azureKey) {
+    // Force initialisation of azureService so _azureKey is populated.
+    azureService();
+  }
+  if (!_azureKey) throw new Error("Azure shared-key credential unavailable");
+
+  const expiresOn = new Date(Date.now() + expiresIn * 1000);
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName: AZURE_CONTAINER,
+      blobName: key,
+      permissions: BlobSASPermissions.parse("r"),
+      expiresOn,
+      contentDisposition: downloadFilename
+        ? buildContentDisposition("attachment", downloadFilename)
+        : undefined,
+    },
+    _azureKey,
+  ).toString();
+  const accountName = _azureKey.accountName;
+  return `https://${accountName}.blob.core.windows.net/${AZURE_CONTAINER}/${encodeURIComponent(
+    key,
+  )}?${sas}`;
+}
+
+// ---------------------------------------------------------------------------
+// R2 (S3-compatible) backend — kept for backwards compatibility
+// ---------------------------------------------------------------------------
+
+const R2_BUCKET = process.env.R2_BUCKET_NAME ?? "mike";
+
+async function r2Client() {
+  const { S3Client } = await import("@aws-sdk/client-s3");
   return new S3Client({
     region: "auto",
     endpoint: process.env.R2_ENDPOINT_URL!,
@@ -28,27 +199,16 @@ function getClient(): S3Client {
   });
 }
 
-const BUCKET = process.env.R2_BUCKET_NAME ?? "mike";
-
-export const storageEnabled = Boolean(
-  process.env.R2_ENDPOINT_URL &&
-  process.env.R2_ACCESS_KEY_ID &&
-  process.env.R2_SECRET_ACCESS_KEY,
-);
-
-// ---------------------------------------------------------------------------
-// Upload
-// ---------------------------------------------------------------------------
-
-export async function uploadFile(
+async function r2Upload(
   key: string,
   content: ArrayBuffer,
   contentType: string,
 ): Promise<void> {
-  const client = getClient();
+  const { PutObjectCommand } = await import("@aws-sdk/client-s3");
+  const client = await r2Client();
   await client.send(
     new PutObjectCommand({
-      Bucket: BUCKET,
+      Bucket: R2_BUCKET,
       Key: key,
       Body: Buffer.from(content),
       ContentType: contentType,
@@ -56,16 +216,12 @@ export async function uploadFile(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Download
-// ---------------------------------------------------------------------------
-
-export async function downloadFile(key: string): Promise<ArrayBuffer | null> {
-  if (!storageEnabled) return null;
+async function r2Download(key: string): Promise<ArrayBuffer | null> {
   try {
-    const client = getClient();
+    const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const client = await r2Client();
     const response = await client.send(
-      new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+      new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }),
     );
     if (!response.Body) return null;
     const bytes = await response.Body.transformToByteArray();
@@ -75,19 +231,74 @@ export async function downloadFile(key: string): Promise<ArrayBuffer | null> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Delete
-// ---------------------------------------------------------------------------
+async function r2Delete(key: string): Promise<void> {
+  try {
+    const { DeleteObjectCommand } = await import("@aws-sdk/client-s3");
+    const client = await r2Client();
+    await client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+  } catch {
+    // ignore
+  }
+}
 
-export async function deleteFile(key: string): Promise<void> {
-  if (!storageEnabled) return;
-  const client = getClient();
-  await client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+async function r2SignedUrl(
+  key: string,
+  expiresIn: number,
+  downloadFilename?: string,
+): Promise<string> {
+  const { GetObjectCommand } = await import("@aws-sdk/client-s3");
+  const { getSignedUrl: awsGetSignedUrl } = await import(
+    "@aws-sdk/s3-request-presigner"
+  );
+  const client = await r2Client();
+  const command = new GetObjectCommand({
+    Bucket: R2_BUCKET,
+    Key: key,
+    ResponseContentDisposition: downloadFilename
+      ? buildContentDisposition("attachment", downloadFilename)
+      : undefined,
+  });
+  return awsGetSignedUrl(client, command, { expiresIn });
 }
 
 // ---------------------------------------------------------------------------
-// Signed URL (pre-signed for temporary direct access)
+// Public API — same shape as before
 // ---------------------------------------------------------------------------
+
+export const storageEnabled = (() => {
+  if (BACKEND === "local") return true;
+  if (BACKEND === "azure")
+    return !!process.env.AZURE_STORAGE_CONNECTION_STRING;
+  return Boolean(
+    process.env.R2_ENDPOINT_URL &&
+      process.env.R2_ACCESS_KEY_ID &&
+      process.env.R2_SECRET_ACCESS_KEY,
+  );
+})();
+
+export async function uploadFile(
+  key: string,
+  content: ArrayBuffer,
+  contentType: string,
+): Promise<void> {
+  if (BACKEND === "local") return localUpload(key, content);
+  if (BACKEND === "azure") return azureUpload(key, content, contentType);
+  return r2Upload(key, content, contentType);
+}
+
+export async function downloadFile(key: string): Promise<ArrayBuffer | null> {
+  if (!storageEnabled) return null;
+  if (BACKEND === "local") return localDownload(key);
+  if (BACKEND === "azure") return azureDownload(key);
+  return r2Download(key);
+}
+
+export async function deleteFile(key: string): Promise<void> {
+  if (!storageEnabled) return;
+  if (BACKEND === "local") return localDelete(key);
+  if (BACKEND === "azure") return azureDelete(key);
+  return r2Delete(key);
+}
 
 export async function getSignedUrl(
   key: string,
@@ -96,24 +307,18 @@ export async function getSignedUrl(
 ): Promise<string | null> {
   if (!storageEnabled) return null;
   try {
-    const client = getClient();
-    // Override the response Content-Disposition so the browser uses this
-    // filename on download, instead of the last path segment of the R2 key
-    // (which includes the document UUID). The `download` attribute on <a>
-    // is ignored for cross-origin URLs, so we have to set it server-side.
-    const responseContentDisposition = downloadFilename
-      ? buildContentDisposition("attachment", downloadFilename)
-      : undefined;
-    const command = new GetObjectCommand({
-      Bucket: BUCKET,
-      Key: key,
-      ResponseContentDisposition: responseContentDisposition,
-    });
-    return await awsGetSignedUrl(client, command, { expiresIn });
+    if (BACKEND === "local") return localSignedUrl(key, downloadFilename);
+    if (BACKEND === "azure")
+      return azureSignedUrl(key, expiresIn, downloadFilename);
+    return await r2SignedUrl(key, expiresIn, downloadFilename);
   } catch {
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Filename / content-disposition helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 export function normalizeDownloadFilename(name: string): string {
   const trimmed = name.trim();
@@ -141,7 +346,7 @@ export function buildContentDisposition(
 }
 
 // ---------------------------------------------------------------------------
-// Storage key helpers
+// Storage key helpers (unchanged)
 // ---------------------------------------------------------------------------
 
 export function storageKey(

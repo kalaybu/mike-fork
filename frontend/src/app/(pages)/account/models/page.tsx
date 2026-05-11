@@ -66,9 +66,9 @@ export default function ModelsAndApiKeysPage() {
                     own instance of Mike.
                 </p>
                 <p className="text-xs text-gray-400 mb-4 max-w-xl">
-                    Title generation automatically routes to the cheapest model
-                    of whichever provider you&rsquo;ve configured (Gemini Flash
-                    Lite if a Gemini key is set, otherwise Claude Haiku).
+                    Title generation automatically routes to a cheap model
+                    (Azure GPT-4.1 mini by default; falls back to Claude Haiku
+                    or Gemini Flash Lite if you&rsquo;ve added those keys).
                 </p>
                 <div className="space-y-4 max-w-xl">
                     <ApiKeyField
@@ -105,7 +105,11 @@ function TabularModelDropdown({
     const [isOpen, setIsOpen] = useState(false);
     const selected = MODELS.find((m) => m.id === value);
     const selectedAvailable = isModelAvailable(value, apiKeys);
-    const groups: ("Anthropic" | "Google")[] = ["Anthropic", "Google"];
+    const groups: ("Azure OpenAI" | "Anthropic" | "Google")[] = [
+        "Azure OpenAI",
+        "Anthropic",
+        "Google",
+    ];
 
     return (
         <DropdownMenu onOpenChange={setIsOpen}>
