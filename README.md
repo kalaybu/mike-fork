@@ -1,9 +1,18 @@
 # Mike (Azure fork)
 
-Modified version of [Mike](https://github.com/willchen96/mike) configured to
-run on Microsoft Azure: SQL Server for the database, Azure OpenAI for LLM,
-Azure Blob / Azure Files for document storage. See [NOTICE.md](./NOTICE.md)
-for a full list of modifications and the AGPL-3.0 attribution.
+Modified version of [Mike](https://github.com/willchen96/mike) that drops the
+Supabase, Cloudflare R2, and OpenRouter dependencies in favour of a
+Microsoft Azure stack:
+
+- **Azure SQL Server** for the database (self-hosted SQL Server for local dev)
+- **JWT + bcrypt** auth, replacing Supabase Auth
+- **Azure OpenAI** for LLM (Anthropic Claude and Google Gemini remain
+  available as optional providers)
+- **Azure Blob** or a mounted **Azure Files** share for document storage
+  (local filesystem for dev), replacing Cloudflare R2
+
+See [NOTICE.md](./NOTICE.md) for the AGPL-3.0 attribution and a full list
+of modifications.
 
 ## Contents
 
