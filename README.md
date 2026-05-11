@@ -75,6 +75,29 @@ cd frontend && npm run dev
 
 Open `http://localhost:3000`, sign up, and try a chat.
 
+## Authentication
+
+Auth is handled entirely by the Express backend — no Supabase, no third-party
+identity provider.
+
+- **Users table** (`dbo.users`): email + bcrypt password hash, created by
+  the schema in `backend/migrations/000_one_shot_schema.sql`.
+- **Signup** (`POST /auth/signup`) — validates email, hashes the password
+  with bcrypt (cost 10), inserts into `dbo.users`, bootstraps a row in
+  `dbo.user_profiles`, and returns a JWT.
+- **Login** (`POST /auth/login`) — looks up the user by email, verifies the
+  password hash, returns a JWT.
+- **Session** — JWT is signed with `JWT_SECRET` (HMAC-SHA256), TTL 30 days,
+  contains `{ sub: userId, email }`. The frontend stores it in localStorage
+  under the key `mike_session` and sends it as `Authorization: Bearer <jwt>`
+  on every API call.
+- **Middleware** (`backend/src/middleware/auth.ts`) — verifies the JWT and
+  attaches `userId` / `userEmail` to `res.locals` for downstream handlers.
+
+There is no out-of-the-box SSO or password-reset flow; this is intended for
+internal deployment where users are provisioned by the operator. To add
+either, swap or extend `backend/src/routes/auth.ts`.
+
 ## Production deploy on Azure
 
 - Backend: Web App for Containers (image from `backend/Dockerfile`), VNET
